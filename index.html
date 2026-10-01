@@ -469,7 +469,9 @@ const PLAN = {
 
 /* 户型可整体替换：导入的方案 JSON 若带 layout 字段，先清空当前户型再换成文件里的（原地修改，引用不变） */
 const clone = o => JSON.parse(JSON.stringify(o));
-const LAYOUT_DEFAULT = clone({walls:WALLS, wins:WINS, doors:DOORS, slides:SLIDES, rooms:ROOMS, dims:DIMS, bounds:BOUNDS, ...PLAN});
+// 已确认拆除的墙：离开拆改模式时从 walls 移到这里，只留位置，用来补地面、统计拆除长度
+const REMOVED = [];
+const LAYOUT_DEFAULT = clone({walls:WALLS, wins:WINS, doors:DOORS, slides:SLIDES, rooms:ROOMS, dims:DIMS, removed:REMOVED, bounds:BOUNDS, ...PLAN});
 let layoutVer = 0, layoutSig = null;
 function applyLayout(L){
   const sig = JSON.stringify(L || null);
@@ -477,7 +479,7 @@ function applyLayout(L){
   layoutSig = sig; layoutVer++;
   // 只用文件里给出的字段，不混入默认户型的入户标识、过梁等；缺省项按边界推算
   const d = LAYOUT_DEFAULT; L = clone(L || d);
-  [[WALLS,'walls'],[WINS,'wins'],[DOORS,'doors'],[SLIDES,'slides'],[ROOMS,'rooms'],[DIMS,'dims']].forEach(([a,k]) => a.splice(0, a.length, ...(L[k] || [])));
+  [[WALLS,'walls'],[WINS,'wins'],[DOORS,'doors'],[SLIDES,'slides'],[ROOMS,'rooms'],[DIMS,'dims'],[REMOVED,'removed']].forEach(([a,k]) => a.splice(0, a.length, ...(L[k] || [])));
   Object.assign(BOUNDS, L.bounds || d.bounds);
   const c = L.center || [BOUNDS.x + BOUNDS.w/2, BOUNDS.y + BOUNDS.h/2];
   Object.keys(PLAN).forEach(k => delete PLAN[k]);
@@ -605,7 +607,7 @@ function commit(before){ undoStack.push(before); if (undoStack.length > 150) und
 function mutate(fn){ const b = snap(); fn(); commit(b); renderAll(); }
 function undo(){ if (!undoStack.length) return toast(tr('没有可撤销的操作', 'Nothing to undo')); redoStack.push(snap()); state = JSON.parse(undoStack.pop()); applyLayout(state.layout); validateSel(); save(); renderAll(); }
 function redo(){ if (!redoStack.length) return; undoStack.push(snap()); state = JSON.parse(redoStack.pop()); applyLayout(state.layout); validateSel(); save(); renderAll(); }
-function validateSel(){ if (ui.sel?.kind==='furn' && !getF(ui.sel.id)) ui.sel = null; }
+function validateSel(){ if (ui.sel?.kind==='furn' && !getF(ui.sel.id) || ui.sel?.kind==='room' && !ROOMS.some(r => r.id === ui.sel.id)) ui.sel = null; }
 const getF = id => state.furniture.find(f => f.id === id);
 
 /* ======================= 几何工具 ======================= */
@@ -790,15 +792,17 @@ function renderFurn(){
   }).join('');
 }
 
+// 拆掉的墙位置铺上旁边房间的地面
+function floorPatch(w){
+  const r = wallFloorRoom(w);
+  return r ? `<rect x="${w[0]}" y="${w[1]}" width="${w[2]-w[0]}" height="${w[3]-w[1]}" fill="url(#m-${state.rooms[r.id].mat})"/>` : '';
+}
 function renderWalls(){
-  $('#gWalls').innerHTML = WALLS.map((w,i) => {
+  $('#gWalls').innerHTML = REMOVED.map(floorPatch).join('') + WALLS.map((w,i) => {
     const [x0,y0,x1,y1,k] = w, id = 'w'+i, dem = state.demolished.includes(id);
     let fill = k==='b' ? (ui.layers.bearing ? '#b8412c' : '#26241f') : k==='low' ? '#e9e3d8' : k==='e' ? '#8f897d' : '#a7a195';
     let ex = k==='low' ? 'stroke="#8f897d" stroke-width="1" vector-effect="non-scaling-stroke"' : '';
-    if (dem && ui.tool !== 'demolish'){        // 离开拆改模式即生效：墙消失，铺上旁边房间的地面
-      const r = wallFloorRoom(w);
-      return r ? `<rect x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" fill="url(#m-${state.rooms[r.id].mat})"/>` : '';
-    }
+    if (dem && ui.tool !== 'demolish') return floorPatch(w);   // 拆改模式外：墙已消失（如撤销回来的待拆状态）
     if (dem){ fill = 'rgba(198,91,58,.12)'; ex = 'stroke="#c65b3a" stroke-width="1.2" stroke-dasharray="5 3" vector-effect="non-scaling-stroke"'; }
     return `<rect class="wall" data-wall="${id}" x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" fill="${fill}" ${ex}/>`;
   }).join('');
@@ -958,7 +962,17 @@ function renderSel(){
     }
   } else if (ui.sel?.kind === 'room'){
     const r = ROOMS.find(r => r.id === ui.sel.id);
-    s += `<polygon points="${r.poly.map(p=>p.join(',')).join(' ')}" fill="rgba(181,101,58,.08)" stroke="#b5653a" stroke-width="2" vector-effect="non-scaling-stroke" pointer-events="none"/>`;
+    if (r){
+      s += `<polygon points="${r.poly.map(p=>p.join(',')).join(' ')}" fill="rgba(181,101,58,.08)" stroke="#b5653a" stroke-width="2" vector-effect="non-scaling-stroke" pointer-events="none"/>`;
+      // 每条边中点的手柄：沿垂直方向拖动这条边，调整房间范围
+      if (ui.tool === 'select') r.poly.forEach((a, i) => {
+        const b = r.poly[(i+1) % r.poly.length], vert = a[0] === b[0];
+        if (Math.hypot(b[0]-a[0], b[1]-a[1]) < 200) return;   // 太短的边不放手柄
+        const x = (a[0]+b[0])/2, y = (a[1]+b[1])/2, hs = (COARSE ? 9 : 5)*k, hit = (COARSE ? 18 : 9)*k;
+        s += `<g data-redge="${i}" style="cursor:${vert ? 'ew' : 'ns'}-resize"><circle cx="${x}" cy="${y}" r="${hit}" fill="transparent"/>
+          <rect x="${x-hs}" y="${y-hs}" width="${2*hs}" height="${2*hs}" fill="#fff" stroke="#b5653a" stroke-width="1.5" vector-effect="non-scaling-stroke"><title>${tr('拖动调整房间范围','Drag to adjust the room')}</title></rect></g>`;
+      });
+    }
   }
   $('#gSel').innerHTML = s;
 }
@@ -1008,7 +1022,7 @@ function overviewPanel(){
   let cost = 0;
   const matRows = Object.entries(byMat).map(([m,a]) => { const c = a*MATS[m].price*1.05; cost += c;
     return `<tr><td><span class="sw" style="background:${MATS[m].sw}"></span>${nm(MATS[m].name)}</td><td class="r">${fmt(a,1)} m²</td><td class="r">¥${Math.round(c).toLocaleString()}</td></tr>`; }).join('');
-  const dem = state.demolished.map(id => WALLS[+id.slice(1)]);
+  const dem = [...REMOVED, ...state.demolished.map(id => WALLS[+id.slice(1)]).filter(Boolean)];
   const demLen = dem.reduce((a,w) => a + Math.max(w[2]-w[0], w[3]-w[1]), 0) / 1000;
   return `
   <section><h3>${tr('房间面积','Room Areas')} <small>${tr('点击查看 / 更换地面','Click to view / change flooring')}</small></h3>
@@ -1117,7 +1131,9 @@ function roomPanel(r){
       <div><small>${tr('周长','Perimeter')}</small><span class="big">${fmt(perim(r.poly),1)}</span> m</div>
       <div><small>${tr('开间','Width')}</small><span class="big">${x1-x0}</span> mm</div>
       <div><small>${tr('进深','Depth')}</small><span class="big">${y1-y0}</span> mm</div></div>
-    <div class="muted">${tr(`墙面面积（层高 2.8m，未扣门窗）约 ${fmt(perim(r.poly)*2.8,1)} m²`, `Wall area (2.8m ceiling, openings not deducted) ≈ ${fmt(perim(r.poly)*2.8,1)} m²`)}</div></section>
+    <div class="muted">${tr(`墙面面积（层高 2.8m，未扣门窗）约 ${fmt(perim(r.poly)*2.8,1)} m²`, `Wall area (2.8m ceiling, openings not deducted) ≈ ${fmt(perim(r.poly)*2.8,1)} m²`)}</div>
+    <div class="muted">${tr('拖动房间边上的方块可调整房间范围', 'Drag the squares on the room edges to adjust its extent')}</div>
+    <div class="actions"><button class="btn danger" id="rDel">${tr('删除房间','Delete room')}</button></div></section>
   <section><h3>${tr('地面材料','Flooring')}</h3><div class="mats">${mats}</div>
     <div class="total"><span>${tr('材料估价','Estimated cost')}</span><b>¥${Math.round(a*MATS[st.mat].price*1.05).toLocaleString()}</b></div></section>
   <section><h3>${tr('房间内家具','Furniture in room')} <small>${tr(`${inside.length} 件`, `${inside.length} items`)}</small></h3>
@@ -1130,6 +1146,25 @@ function bindRoomPanel(){
   document.querySelectorAll('#panel [data-mat]').forEach(b => b.onclick = () => mutate(() => state.rooms[id].mat = b.dataset.mat));
   document.querySelectorAll('#panel tr[data-fid]').forEach(tr => tr.onclick = () => select({kind:'furn', id:tr.dataset.fid}));
   $('#back').onclick = () => select(null);
+  $('#rDel').onclick = () => deleteRoom(id);
+}
+// 删除房间：从户型里去掉（可撤销），家具保留
+function deleteRoom(id){
+  const name = state.rooms[id]?.name;
+  ui.sel = null;
+  editLayout(l => { l.rooms = l.rooms.filter(r => r.id !== id); delete state.rooms[id]; });
+  toast(tr(`已删除房间「${name}」`, `Deleted room "${nm(name)}"`));
+}
+// 拖动房间的一条边：两端点一起沿垂直方向移动；相邻两条边至少保留 100 mm，不让多边形翻折
+function moveRoomEdge(r, i, q){
+  const P = r.poly, n = P.length, a = P[i], b = P[(i+1) % n], vert = a[0] === b[0], k = vert ? 0 : 1;
+  let v = vert ? q.x : q.y;
+  for (const nb of [P[(i-1+n) % n], P[(i+2) % n]]){
+    const sgn = Math.sign(a[k] - nb[k]); if (!sgn) continue;
+    v = sgn > 0 ? Math.max(v, nb[k] + 100) : Math.min(v, nb[k] - 100);
+  }
+  a[k] = b[k] = v;
+  if (r.at && !inPoly(r.at[0], r.at[1], P)){ const [x0,y0,x1,y1] = bbox(P); r.at = [(x0+x1)/2, (y0+y1)/2]; }
 }
 
 function furnPanel(f){
@@ -1170,7 +1205,7 @@ function bindFurnPanel(f){
 /* ======================= 操作 ======================= */
 function select(sel){ ui.sel = sel; renderSel(); renderPanel(); }
 function rotateSel(d){ if (ui.sel?.kind==='furn') mutate(() => { const f = getF(ui.sel.id); f.rot = norm(f.rot + d); }); }
-function deleteSel(){ if (ui.sel?.kind==='furn'){ const id = ui.sel.id; ui.sel = null; mutate(() => state.furniture = state.furniture.filter(f => f.id !== id)); } }
+function deleteSel(){ if (ui.sel?.kind==='room') return deleteRoom(ui.sel.id); if (ui.sel?.kind==='furn'){ const id = ui.sel.id; ui.sel = null; mutate(() => state.furniture = state.furniture.filter(f => f.id !== id)); } }
 function duplicateSel(){
   if (ui.sel?.kind !== 'furn') return;
   const f = getF(ui.sel.id), n = {...f, id:uid(), cx:f.cx+200, cy:f.cy+200};
@@ -1210,7 +1245,19 @@ function toggleWall(id){
   toast(on ? tr('已恢复墙体', 'Wall restored') : tr(`已标记拆除 ${Math.max(w[2]-w[0], w[3]-w[1])} mm 墙体`, `Marked ${Math.max(w[2]-w[0], w[3]-w[1])} mm of wall for removal`));
 }
 
+// 离开拆改模式时保存拆除：标记的墙从户型里删掉（记一步撤销），再进来就看不到了
+function saveDemolished(){
+  if (!state.demolished.length) return;
+  const dem = new Set(state.demolished), n = dem.size;
+  editLayout(l => {
+    l.removed = [...(l.removed || []), ...l.walls.filter((w, i) => dem.has('w'+i)).map(w => w.slice(0, 4))];
+    l.walls = l.walls.filter((w, i) => !dem.has('w'+i));
+    state.demolished = [];
+  });
+  toast(tr(`已拆除 ${n} 段墙体`, `Removed ${n} wall segment${n > 1 ? 's' : ''}`));
+}
 function setTool(t){
+  if (ui.tool === 'demolish' && t !== 'demolish') saveDemolished();
   ui.tool = t; ui.mA = null; ui.mCur = null;
   svg.setAttribute('class', 'tool-' + t);
   document.querySelectorAll('#tools .btn').forEach(b => b.classList.toggle('on', b.dataset.tool === t));
@@ -1306,6 +1353,11 @@ function endDrag(cancel){
     if (!cancel && !d.moved && ui.tool === 'select') select(d.room ? {kind:'room', id:d.room} : null);
     return;
   }
+  if (d.kind === 'roomEdge'){
+    if (cancel && d.moved){ state = JSON.parse(d.before); applyLayout(state.layout); renderAll(); return; }
+    if (d.moved){ commit(d.before); renderAll(); const r = ROOMS.find(r => r.id === d.id); toast(tr(`房间面积 ${fmt(area(r.poly))} m²`, `Room area ${fmt(area(r.poly))} m²`)); }
+    return;
+  }
   if (d.kind === 'wallEnd'){
     if (cancel && d.moved){ state = JSON.parse(d.before); applyLayout(state.layout); renderAll(); return; }
     if (d.moved){ const w = WALLS[d.i]; commit(d.before); renderAll(); toast(tr(`墙长 ${Math.max(w[2]-w[0], w[3]-w[1])} mm`, `Wall length ${Math.max(w[2]-w[0], w[3]-w[1])} mm`)); }
@@ -1347,6 +1399,11 @@ svg.addEventListener('pointerdown', e => {
     else { const a = ui.mA; ui.mA = null; ui.mCur = null; finishLine(a, q); }
     renderMeasure(); return;
   }
+  const re = ui.tool === 'select' && ui.sel?.kind === 'room' && t.closest('[data-redge]');
+  if (re){
+    drag = {kind:'roomEdge', id:ui.sel.id, i:+re.dataset.redge, sx:e.clientX, sy:e.clientY, before:snap(), moved:false};
+    svg.setPointerCapture(e.pointerId); return;
+  }
   const h = t.closest('[data-handle]');
   if (h && ui.sel?.kind === 'furn'){
     drag = {kind:h.dataset.handle, id:ui.sel.id, sx:e.clientX, sy:e.clientY, before:snap(), moved:false};
@@ -1381,6 +1438,13 @@ svg.addEventListener('pointermove', e => {
   if (drag.kind === 'measure'){
     if (far) drag.moved = true;
     ui.mCur = snapPoint(p, e.shiftKey || drawsWall()); renderMeasure(); return;
+  }
+  if (drag.kind === 'roomEdge'){
+    if (!drag.moved && !far) return;
+    drag.moved = true;
+    state.layout ??= clone(LAYOUT_DEFAULT);
+    moveRoomEdge(state.layout.rooms.find(r => r.id === drag.id), drag.i, snapPoint(p, false));
+    applyLayout(state.layout); renderAll(); return;
   }
   if (drag.kind === 'wallEnd'){
     if (!drag.moved && !far) return;
@@ -2469,13 +2533,14 @@ function buildArch(){
     }
   });
   [...DOORS, ...SLIDES].forEach(d => { const [x0, y0, x1, y1] = d.rect; const s = box(M(x1-x0), .012, M(y1-y0), mat('#d8d0c0', {roughness:.3}), wx((x0+x1)/2), 0, wz((y0+y1)/2)); s.castShadow = false; archFloor.add(s); });
+  const patch = w => {                         // 拆掉的墙位置补地面
+    const r = wallFloorRoom(w); if (!r) return;
+    const geo = new THREE.ShapeGeometry(shapeOf(R(w[0], w[1], w[2], w[3]))); geo.rotateX(-Math.PI/2);
+    const fl = new THREE.Mesh(geo, floorMat(state.rooms[r.id].mat)); fl.receiveShadow = true; archFloor.add(fl);
+  };
+  REMOVED.forEach(patch);
   WALLS.forEach((w, i) => {
-    if (state.demolished.includes('w'+i)){
-      const r = wallFloorRoom(w); if (!r) return;
-      const geo = new THREE.ShapeGeometry(shapeOf(R(w[0], w[1], w[2], w[3]))); geo.rotateX(-Math.PI/2);
-      const fl = new THREE.Mesh(geo, floorMat(state.rooms[r.id].mat)); fl.receiveShadow = true; archFloor.add(fl);
-      return;
-    }
+    if (state.demolished.includes('w'+i)) return patch(w);
     wallBox(w, 0, w[4] === 'low' ? Math.min(1, top) : top);
     colliders.push([wx(w[0]), wz(w[1]), wx(w[2]), wz(w[3])]);
   });
