@@ -1155,16 +1155,32 @@ function deleteRoom(id){
   editLayout(l => { l.rooms = l.rooms.filter(r => r.id !== id); delete state.rooms[id]; });
   toast(tr(`已删除房间「${name}」`, `Deleted room "${nm(name)}"`));
 }
-// 拖动房间的一条边：两端点一起沿垂直方向移动；相邻两条边至少保留 100 mm，不让多边形翻折
-function moveRoomEdge(r, i, q){
-  const P = r.poly, n = P.length, a = P[i], b = P[(i+1) % n], vert = a[0] === b[0], k = vert ? 0 : 1;
-  let v = vert ? q.x : q.y;
+// 拖动房间的一条边：两端点一起沿垂直方向移动。p = 指针原始位置，q = 吸附墙面后的位置
+// 也吸附到本房间其他顶点的坐标，方便把两段边拉成一条线；相邻边最多缩到 0，不让多边形翻折
+function moveRoomEdge(r, i, p, q){
+  const P = r.poly, n = P.length, a = P[i], b = P[(i+1) % n], vert = a[0] === b[0], k = vert ? 0 : 1, raw = vert ? p.x : p.y;
+  let v = vert ? q.x : q.y, best = Math.min(Math.abs(v - raw), 8/view.s);
+  P.forEach(o => { if (o !== a && o !== b && Math.abs(o[k] - raw) < best){ best = Math.abs(o[k] - raw); v = o[k]; } });
   for (const nb of [P[(i-1+n) % n], P[(i+2) % n]]){
     const sgn = Math.sign(a[k] - nb[k]); if (!sgn) continue;
-    v = sgn > 0 ? Math.max(v, nb[k] + 100) : Math.min(v, nb[k] - 100);
+    v = sgn > 0 ? Math.max(v, nb[k]) : Math.min(v, nb[k]);
   }
   a[k] = b[k] = v;
   if (r.at && !inPoly(r.at[0], r.at[1], P)){ const [x0,y0,x1,y1] = bbox(P); r.at = [(x0+x1)/2, (y0+y1)/2]; }
+}
+
+// 去掉重合点和共线的中间点：两段边对齐后合并成一条
+function simplifyPoly(P){
+  let changed = true;
+  while (changed && P.length > 3){
+    changed = false;
+    for (let i = 0; i < P.length; i++){
+      const a = P[(i-1+P.length) % P.length], b = P[i], c = P[(i+1) % P.length];
+      const dup = b[0] === c[0] && b[1] === c[1], line = (a[0] === b[0] && b[0] === c[0]) || (a[1] === b[1] && b[1] === c[1]);
+      if (dup || line){ P.splice(i, 1); changed = true; break; }
+    }
+  }
+  return P;
 }
 
 function furnPanel(f){
@@ -1355,7 +1371,9 @@ function endDrag(cancel){
   }
   if (d.kind === 'roomEdge'){
     if (cancel && d.moved){ state = JSON.parse(d.before); applyLayout(state.layout); renderAll(); return; }
-    if (d.moved){ commit(d.before); renderAll(); const r = ROOMS.find(r => r.id === d.id); toast(tr(`房间面积 ${fmt(area(r.poly))} m²`, `Room area ${fmt(area(r.poly))} m²`)); }
+    if (d.moved){
+      const lr = state.layout.rooms.find(r => r.id === d.id); simplifyPoly(lr.poly); applyLayout(state.layout);
+      commit(d.before); renderAll(); const r = ROOMS.find(r => r.id === d.id); toast(tr(`房间面积 ${fmt(area(r.poly))} m²`, `Room area ${fmt(area(r.poly))} m²`)); }
     return;
   }
   if (d.kind === 'wallEnd'){
@@ -1443,7 +1461,7 @@ svg.addEventListener('pointermove', e => {
     if (!drag.moved && !far) return;
     drag.moved = true;
     state.layout ??= clone(LAYOUT_DEFAULT);
-    moveRoomEdge(state.layout.rooms.find(r => r.id === drag.id), drag.i, snapPoint(p, false));
+    moveRoomEdge(state.layout.rooms.find(r => r.id === drag.id), drag.i, p, snapPoint(p, false));
     applyLayout(state.layout); renderAll(); return;
   }
   if (drag.kind === 'wallEnd'){
